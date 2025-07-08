@@ -1,7 +1,7 @@
 import { unlink } from 'fs/promises';
 import { FilePtr } from '../types/FilePtr.js';
 import ffmpeg, { FfprobeData } from 'fluent-ffmpeg';
-import extractFrames from 'ffmpeg-extract-frames';
+
 import sharp from 'sharp';
 import { encode } from 'blurhash';
 import { randomUUID } from 'crypto';
@@ -114,6 +114,28 @@ class CompressorService {
     }
   }
 
+  async extractFrameWithFfmpeg(inputPath: string, outputPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .on('end', () => {
+          console.log(`✅ Frame extracted successfully to ${outputPath}`);
+          resolve();
+        })
+        .on('error', (err, stdout, stderr) => {
+          console.error(`❌ Error extracting frame:`, err.message);
+          console.error('FFmpeg stdout:', stdout);
+          console.error('FFmpeg stderr:', stderr);
+          reject(err);
+        })
+        .screenshots({
+          count: 1,
+          timemarks: ['5%'], // Extract a frame from 5% into the video
+          filename: outputPath,
+          folder: '/tmp', // fluent-ffmpeg requires a folder
+        });
+    });
+  }
+
   async mkThumbnail(filePtr: FilePtr): Promise<FilePtr> {
     const thumbPath = `${filePtr.fileLocation}__thumbnail__.jpg`;
     const newPtr: FilePtr = {
@@ -122,13 +144,19 @@ class CompressorService {
       fileLocation: thumbPath,
     };
     if (filePtr.fileInfo.fileType === 'VIDEO') {
-      const loc = `${filePtr.fileLocation}__thumbnail__preproc.jpg`;
-      await extractFrames({
-        input: filePtr.fileLocation,
-        output: loc,
-      });
-      await this.createPhotoThumbnail({ ...filePtr, fileLocation: loc }, newPtr);
-      await unlink(loc);
+      const loc = `${randomUUID()}_preproc.jpg`;
+      const tempOutputPath = `/tmp/${loc}`;
+      console.log(`generating videothumb for`, filePtr.fileLocation);
+      
+      // Use the new robust frame extraction method
+      await this.extractFrameWithFfmpeg(filePtr.fileLocation, loc);
+   
+      console.log(`generated videothumb`, filePtr.fileLocation);
+      await this.createPhotoThumbnail({ ...filePtr, fileLocation: tempOutputPath }, newPtr);
+      
+      // Clean up the temporary frame file
+      await unlink(tempOutputPath);
+      
       console.log('Made video thumbnail!');
       return newPtr;
     } else if (filePtr.fileInfo.fileType === 'IMAGE') {
@@ -144,6 +172,7 @@ class CompressorService {
     largestHeight: '480' | '720' | '1080',
     filePtr: FilePtr
   ): Promise<FilePtr> {
+    console.log("Making scaled with ptr", filePtr)
     if (filePtr.fileInfo.fileType === 'IMAGE') {
       const outputFileName = `${filePtr.fileLocation}_${largestHeight}p.jpeg`;
       const newPtr: FilePtr = {
@@ -166,11 +195,12 @@ class CompressorService {
 
     // Use a unique ID for pass log files to prevent conflicts during concurrent runs
     const passLogFile = `${filePtr.fileLocation}_${randomUUID()}.log`;
-    const pass1Output = `${outputFileName}.pass1.tmp.mp4`;
+    const pass1Output = `${filePtr.fileLocation}_${randomUUID()}.pass1.tmp.mp4`;
 
     try {
       // --- PASS 1 ---
       // Gathers statistics about the video for the second pass.
+      console.log('ffmpeg ptr', filePtr.fileLocation )
       const pass1Command = ffmpeg(filePtr.fileLocation)
         .inputOptions(['-fflags +genpts'])
         .outputOptions([
@@ -190,6 +220,7 @@ class CompressorService {
 
       // --- PASS 2 ---
       // The actual encoding using the stats from pass 1.
+          console.log("Making scaled pass2 with ptr", filePtr)
       const pass2Command = ffmpeg(filePtr.fileLocation)
         .inputOptions(['-fflags +genpts'])
         .outputOptions([

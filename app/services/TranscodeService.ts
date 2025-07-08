@@ -54,6 +54,9 @@ class TranscodeService {
             await this.workItem(file)
           } catch (error) {
             console.error(`Error processing file ${file.fileKey}:`, error)
+            // get stack trace
+            console.error(error instanceof Error ? error.stack : 'No stack trace available');
+            
             // Optionally, report the error back to the coordinator
    /*          await MainServerAxiosService.post(`/coordinator/v1/file-work-failed`, {
               fileId: file.id,
