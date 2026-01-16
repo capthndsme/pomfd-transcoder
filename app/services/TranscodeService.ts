@@ -159,10 +159,14 @@ class TranscodeService {
     const axios = new AxiosWithAuth(`https://${file.serverShard?.domain}`)
 
     // 1. download the file.
-    const filePtr = await DownloaderService.downloadFileToPtr(
-      `https://${file.serverShard?.domain}/${file.fileKey}`,
-      file
-    )
+    const fileKey = file.fileKey ?? ''
+    const domain = file.serverShard?.domain ?? ''
+    const downloadUrl =
+      fileKey.startsWith('http://') || fileKey.startsWith('https://') || fileKey.startsWith('//')
+        ? fileKey
+        : `https://${domain}/${fileKey}`
+
+    const filePtr = await DownloaderService.downloadFileToPtr(downloadUrl, file)
 
     // 1.5 immediately lock 
     await this.markFile(file, 'pending')
