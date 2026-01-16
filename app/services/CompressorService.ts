@@ -170,9 +170,9 @@ class CompressorService {
 
   async mkScaledVidPhoto(
     largestHeight: '480' | '720' | '1080',
-    filePtr: FilePtr
+    filePtr: FilePtr,
   ): Promise<FilePtr> {
-    console.log("Making scaled with ptr", filePtr)
+    console.log('Making scaled with ptr', filePtr);
     if (filePtr.fileInfo.fileType === 'IMAGE') {
       const outputFileName = `${filePtr.fileLocation}_${largestHeight}p.jpeg`;
       const newPtr: FilePtr = {
@@ -184,14 +184,40 @@ class CompressorService {
       console.log('Made image scaled version!');
       return newPtr;
     }
-    
+
     if (filePtr.fileInfo.fileType !== 'VIDEO') {
-        throw new Error('unsupported file type ' + filePtr.fileInfo.fileType);
+      throw new Error('unsupported file type ' + filePtr.fileInfo.fileType);
     }
 
     // --- Video Transcoding Logic ---
     const outputFileName = `${filePtr.fileLocation}_${largestHeight}p.mp4`;
-    const bitrate = { '480': '3M', '720': '5M', '1080': '8M' }[largestHeight];
+    const probeData = await this.ffprobeAsync(filePtr);
+    const videoStream = probeData.streams.find(s => s.codec_type === 'video');
+
+    if (!videoStream?.width || !videoStream?.height) {
+      throw new Error('Could not determine video dimensions');
+    }
+
+    const isVertical = videoStream.height > videoStream.width;
+    const scaleOption = isVertical
+      ? `scale=${largestHeight}:-2`
+      : `scale=-2:${largestHeight}`;
+
+    const baseBitrate = { '480': 3, '720': 6, '1080': 9 }[largestHeight]; // MB
+    const frameRate = videoStream.r_frame_rate
+      ? eval(videoStream.r_frame_rate)
+      : 30;
+
+    let bitrateMultiplier = 1.0;
+    if (frameRate > 50 && frameRate <= 60) {
+      // 60fps
+      bitrateMultiplier = 1.5;
+    } else if (frameRate > 60) {
+      // 120fps
+      bitrateMultiplier = 3.0;
+    }
+
+    const finalBitrate = `${baseBitrate * bitrateMultiplier}M`;
 
     // Use a unique ID for pass log files to prevent conflicts during concurrent runs
     const passLogFile = `${filePtr.fileLocation}_${randomUUID()}.log`;
@@ -199,63 +225,62 @@ class CompressorService {
 
     try {
       // --- PASS 1 ---
-      // Gathers statistics about the video for the second pass.
-      console.log('ffmpeg ptr', filePtr.fileLocation )
+      console.log('ffmpeg ptr', filePtr.fileLocation);
       const pass1Command = ffmpeg(filePtr.fileLocation)
         .inputOptions(['-fflags +genpts'])
         .outputOptions([
-          `-vf scale=-2:${largestHeight}`,
+          `-vf ${scaleOption}`,
           '-c:v libx264',
           '-preset medium',
-          '-b:v ' + bitrate,
+          '-b:v ' + finalBitrate,
           '-pass 1',
-          `-passlogfile ${passLogFile}`, // Explicitly define log file
-          '-an', // No audio needed for the first pass
+          `-passlogfile ${passLogFile}`,
+          '-an',
           '-f mp4',
-          '-y' // Overwrite temp file if it exists
+          '-y',
         ])
-        .output(pass1Output); // Output to a temporary file
+        .output(pass1Output);
 
       await this.runFfmpegCommand(pass1Command, `pass 1 for ${largestHeight}p`);
 
       // --- PASS 2 ---
-      // The actual encoding using the stats from pass 1.
-          console.log("Making scaled pass2 with ptr", filePtr)
+      console.log('Making scaled pass2 with ptr', filePtr);
       const pass2Command = ffmpeg(filePtr.fileLocation)
         .inputOptions(['-fflags +genpts'])
         .outputOptions([
-          `-vf scale=-2:${largestHeight}`,
+          `-vf ${scaleOption}`,
           '-c:v libx264',
           '-preset medium',
-          // *** KEY FIX ***: Specify a common pixel format for broad compatibility.
-          // This is the most likely fix for the "Invalid argument" error.
           '-pix_fmt yuv420p',
-          '-b:v ' + bitrate,
+          '-b:v ' + finalBitrate,
           '-pass 2',
-          `-passlogfile ${passLogFile}`, // Use the same log file as pass 1
+          `-passlogfile ${passLogFile}`,
           '-c:a aac',
           '-b:a 256k',
-          '-movflags +faststart', // Optimizes for web streaming
-          '-y' // Overwrite final file if it exists
+          '-movflags +faststart',
+          '-y',
         ])
         .output(outputFileName);
 
       await this.runFfmpegCommand(pass2Command, `pass 2 for ${largestHeight}p`);
-      
+
       console.log(`✅ Video converted to ${largestHeight}p: ${outputFileName}`);
       return { ...filePtr, fileLocation: outputFileName };
-
     } catch (error) {
-      // Re-throwing the error allows the calling function to handle the failure.
       console.error(`❌ Transcoding to ${largestHeight}p failed.`);
       throw error;
     } finally {
       // --- Cleanup ---
-      // Always attempt to clean up temporary files, even if an error occurred.
       console.log('🧹 Cleaning up temporary transcoding files...');
-      await unlink(pass1Output).catch(err => console.warn(`Could not delete temp file ${pass1Output}: ${err.message}`));
-      await unlink(passLogFile).catch(err => console.warn(`Could not delete log file ${passLogFile}: ${err.message}`));
-      await unlink(passLogFile + ".mbtree").catch(err => console.warn(`Could not delete mbtree file ${passLogFile}.mbtree: ${err.message}`));
+      await unlink(pass1Output).catch(err =>
+        console.warn(`Could not delete temp file ${pass1Output}: ${err.message}`),
+      );
+      await unlink(passLogFile).catch(err =>
+        console.warn(`Could not delete log file ${passLogFile}: ${err.message}`),
+      );
+      await unlink(passLogFile + '.mbtree').catch(err =>
+        console.warn(`Could not delete mbtree file ${passLogFile}.mbtree: ${err.message}`),
+      );
     }
   }
 }

@@ -4,12 +4,22 @@ import { ApiBase } from '../../shared/types/ApiBase.js'
 import MainServerAxiosService from './MainServerAxiosService.js'
 import DownloaderService from './DownloaderService.js'
 import CompressorService from './CompressorService.js'
+import SocketClientService from './SocketClientService.js'
 import { readFile, unlink } from 'fs/promises'
 import AxiosWithAuth from './AxiosWithAuth.js'
 
+/**
+ * TranscodeService - Processes media files for thumbnails and previews
+ * 
+ * Now supports two modes:
+ * 1. Socket.IO (preferred): Real-time push from Coordinator
+ * 2. HTTP polling (fallback): Polls for work if socket is disconnected
+ */
 class TranscodeService {
   #transcodeTotal: number = 0
   #booted = false
+  #useSocket = true // Enable socket mode by default
+
   constructor() {
     console.log('TranscodeService has been initialized.')
     this.start()
@@ -17,16 +27,87 @@ class TranscodeService {
 
   public start() {
     console.log('TranscodeService has started.')
-    // Add any startup logic here
     if (this.#booted) return
-
     this.#booted = true
-    setTimeout(() => this.loop(), 1000)
+
+    if (this.#useSocket) {
+      this.#startSocketMode()
+    } else {
+      // Fallback to polling
+      setTimeout(() => this.loop(), 1000)
+    }
   }
 
+  /**
+   * Socket Mode: Connect to Coordinator and receive work via push
+   */
+  #startSocketMode() {
+    console.log('🔌 Starting in Socket.IO mode...')
+
+    // Boot the socket client
+    SocketClientService.boot()
+
+    // Register our work handler
+    SocketClientService.onNewFile(async (file: FileItem) => {
+      try {
+        await this.workItem(file)
+        return { accepted: true }
+      } catch (error) {
+        console.error(`❌ Work failed for ${file.fileKey}:`, error)
+        return { accepted: false, reason: String(error) }
+      }
+    })
+
+    // Also start a slower fallback loop for any missed work
+    // This handles files that were uploaded before socket connected
+    setTimeout(() => this.#fallbackLoop(), 5000)
+  }
+
+  /**
+   * Fallback loop: Occasionally check for orphaned work
+   * Runs less frequently than the old polling loop
+   */
+  async #fallbackLoop() {
+    try {
+      // Only poll if socket is connected but we're not busy
+      if (SocketClientService.isConnected()) {
+        const status = SocketClientService.getStatus()
+        if (!status.isBusy) {
+          const files = await SocketClientService.requestWork()
+          if (files.length > 0) {
+            console.log(`📋 Fallback: Found ${files.length} orphaned files`)
+            // Process one at a time
+            for (const file of files) {
+              if (SocketClientService.getStatus().isBusy) break
+              try {
+                SocketClientService.setBusy(true, file.id)
+                await this.workItem(file)
+              } catch (error) {
+                console.error(`❌ Fallback work failed:`, error)
+              } finally {
+                SocketClientService.setBusy(false)
+              }
+            }
+          }
+        }
+      } else {
+        // Socket not connected - use HTTP fallback
+        await this.syncWorkHttp()
+      }
+    } catch (e) {
+      console.warn(`Fallback loop failed`, e)
+    } finally {
+      // Run fallback less frequently - every 60 seconds
+      setTimeout(() => this.#fallbackLoop(), 60000)
+    }
+  }
+
+  /**
+   * Old polling loop (kept for fallback)
+   */
   async loop() {
     try {
-      await this.syncWork()
+      await this.syncWorkHttp()
     } catch (e) {
       console.warn(`Transcode Loop failed`, e)
     } finally {
@@ -34,7 +115,10 @@ class TranscodeService {
     }
   }
 
-  async syncWork() {
+  /**
+   * HTTP-based work sync (fallback when socket is down)
+   */
+  async syncWorkHttp() {
     const data = await MainServerAxiosService.get<ApiBase<FileItem[]>>(
       `/coordinator/v1/find-file-work`
     )
@@ -43,44 +127,45 @@ class TranscodeService {
     }
     const files = data.data.data
 
-    console.log(`got work items`, files)
-   // split the WorkItem into 6 so we could multithread
-    const BATCH_SIZE = 1
-    for (let i = 0; i < files.length; i += BATCH_SIZE) {
-      const batch = files.slice(i, i + BATCH_SIZE)
-      await Promise.all(
-        batch.map(async (file) => {
-          try {
-            await this.workItem(file)
-          } catch (error) {
-            console.error(`Error processing file ${file.fileKey}:`, error)
-            // get stack trace
-            console.error(error instanceof Error ? error.stack : 'No stack trace available');
-            
-            // Optionally, report the error back to the coordinator
-   /*          await MainServerAxiosService.post(`/coordinator/v1/file-work-failed`, {
-              fileId: file.id,
-              error: error instanceof Error ? error.message : 'Unknown error',
-            }).catch((err) => console.error('Failed to report error to coordinator:', err)) */
-          }
-        })
-      )
+    if (files.length === 0) return
+
+    console.log(`[HTTP Fallback] got work items`, files.length)
+
+    // Process one at a time for fallback
+    for (const file of files) {
+      try {
+        await this.workItem(file)
+      } catch (error) {
+        console.error(`Error processing file ${file.fileKey}:`, error)
+        console.error(error instanceof Error ? error.stack : 'No stack trace available')
+        await this.markFile(file, null).catch(console.error)
+      }
     }
   }
+
   public getStatus() {
-    return { running: true, total: this.#transcodeTotal }
+    const socketStatus = SocketClientService.getStatus()
+    return {
+      running: true,
+      total: this.#transcodeTotal,
+      socketConnected: socketStatus.connected,
+      socketBusy: socketStatus.isBusy,
+      currentFile: socketStatus.currentFileId,
+    }
   }
 
   async workItem(file: FileItem) {
     // 0. init axios for this instance
-    // routes: /s2s/metadata-patch for upload meta with thumb,
-    // preview-create for preview
     const axios = new AxiosWithAuth(`https://${file.serverShard?.domain}`)
+
     // 1. download the file.
     const filePtr = await DownloaderService.downloadFileToPtr(
       `https://${file.serverShard?.domain}/${file.fileKey}`,
       file
     )
+
+    // 1.5 immediately lock 
+    await this.markFile(file, 'pending')
 
     // 2. extract-metadata 
     const metaPtr = await CompressorService.mkThumbnail(filePtr)
@@ -116,18 +201,7 @@ class TranscodeService {
     console.log('Metadata and meta extracted: ', file.fileKey)
 
     // 5. scaling down
-    // after determining what's the height component
-    // (obviously the smallest one)
     const whatActualHeight = Math.min(file.itemHeight ?? 3, file.itemWidth ?? 4)
-
-    // if it is larger than 480p, make 480p vid/thumbnail. if it is larger than 720p,
-    // make 480+720. if it's larger than 1080p, make 480/720/1080.
-    /**
-    the backend expects this:  
-    const file = request.file('file')
-    const {fileItem,quality} = request.body()
-    and /s2s/preview-create
-     */
 
     if (whatActualHeight >= 480) {
       console.log(`Preview: Since resolution is larger than 480p, making 480p preview.`)
@@ -208,27 +282,26 @@ class TranscodeService {
     await unlink(filePtr.fileLocation).catch(console.warn)
     this.#transcodeTotal++
     console.log(`Finished processing file: ${file.fileKey}`)
-    await this.markFileAsDone(file, 'finished')
-  }
-  /** simple helper to post this to main server:
-   * 
-   * 
-  async markFile({ request, response }: HttpContext) {
-    const { fileId, status } = request.body() // The status  'pending' | 'finished' | 'invalid-file' | null
-    if (!fileId || !status) throw new NamedError('invalid argument', 'einval')
-    const file = await ServerCommunicationService.markFile(fileId, status)
-    return response.ok(createSuccess(file, 'File marked', 'success'))
+    await this.markFile(file, 'finished')
   }
 
+  /**
+   * Mark file status - uses Socket.IO if connected, falls back to HTTP
    */
+  async markFile(file: FileItem, status: 'pending' | 'finished' | 'invalid-file' | null) {
+    // Try socket first
+    if (SocketClientService.isConnected()) {
+      const success = await SocketClientService.markFile(file.id, status)
+      if (success) return
+      console.warn('Socket markFile failed, falling back to HTTP')
+    }
 
-  async markFileAsDone(file: FileItem, status: 'pending' | 'finished' | 'invalid-file' | null) {
+    // Fallback to HTTP
     await MainServerAxiosService.post(`/coordinator/v1/mark-file`, {
       fileId: file.id,
       status,
     }).catch((err) => console.error('Failed to report work done to coordinator:', err))
   }
-  
 }
 
 export default new TranscodeService()
